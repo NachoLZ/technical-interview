@@ -1,0 +1,31 @@
+{
+  "name": "persona-ranker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "build": "next build",
+    "start": "next start",
+    "check": "eslint src && prettier --check \"src/**/*.{ts,tsx}\"",
+    "format": "prettier --write \"src/**/*.{ts,tsx}\"",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.58",
+    "@ai-sdk/openai": "^3.0.41",
+    "ai": "^6.0.116",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "9.39.3",
+    "eslint-config-next": "16.1.6",
+    "prettier": "^3.8.1",
+    "typescript": "^5.7.0"
+  }
+}
