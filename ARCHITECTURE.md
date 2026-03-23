@@ -4,17 +4,19 @@
 
 **Deterministic where possible, AI only where judgment is needed.**
 
-The ranking system is split into three layers:
+The ranking system is split into four layers:
 
 1. **Deterministic classification** (`src/lib/classify.ts`) — Rules derived directly from the persona spec. No API calls, no cost, reproducible. Handles ~60–70% of leads instantly via hard exclusions.
-2. **AI evaluation** (`src/app/api/rank/route.ts`) — Uses an LLM only for things that need real-world knowledge or interpretation: company fit, ambiguous titles, within-company ranking.
-3. **Deterministic post-filter** (`applyPostFilter` in route.ts) — Enforces soft exclusion rules *after* the AI returns. The AI can't override these — they're business rules, not suggestions.
+2. **Company research** (`researchCompany()` in route.ts) — Uses GPT 5.4 with web search to gather qualification signals per company: funding, hiring, PLG, layoffs, what they sell and to whom. One call per unique company, cached and shared across all leads at that company.
+3. **Lead evaluation** (`evaluateBatch()` in route.ts) — Uses the LLM with research context to evaluate each lead: company fit, ambiguous titles, within-company ranking.
+4. **Deterministic post-filter** (`applyPostFilter` in route.ts) — Enforces soft exclusion rules *after* the AI returns. The AI can't override these — they're business rules, not suggestions.
 
 This means:
 - Most leads never touch the LLM (cheaper, faster)
-- The LLM focuses on what it's actually good at (judgment, not table lookups)
+- Company research is done once per company, not per lead (~15 calls, not ~70)
+- The persona spec's Qualification Signals section is actually used (funding, PLG, hiring SDRs, etc.)
 - Soft exclusions are enforced deterministically, not left to the AI's discretion
-- The system degrades gracefully if the AI is unavailable
+- The system degrades gracefully — research failure doesn't block evaluation, AI failure falls back to deterministic
 
 ---
 
@@ -218,32 +220,72 @@ Returns `{ kind: SoftExclusionKind; reason: string }` or null. The `kind` field 
 The POST handler orchestrates the full pipeline:
 1. Classify all leads deterministically
 2. Return instant results for hard-excluded leads
-3. Sort candidates by company → batch → send to AI
-4. Apply deterministic post-filter to AI results
-5. Combine and return all 200 results
+3. Research unique companies via web search (Step 1 — per company)
+4. Evaluate leads with research context (Step 2 — per batch)
+5. Apply deterministic post-filter to AI results
+6. Combine and return all 200 results
 
 ### Model Selection
 
 ```typescript
 function getModel() {
-  if (process.env.OPENAI_API_KEY) return openai(process.env.OPENAI_MODEL ?? "gpt-4o-mini");
+  if (process.env.OPENAI_API_KEY) return openai(process.env.OPENAI_MODEL ?? "gpt-5.4");
   if (process.env.ANTHROPIC_API_KEY) return anthropic(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514");
   throw new Error("...");
 }
 ```
 
-Defaults to cheap, fast models suitable for classification. Model ID overridable via env vars.
+Defaults to capable models. Model ID overridable via `OPENAI_MODEL` / `ANTHROPIC_MODEL` env vars.
 
-**Why gpt-4o-mini:** Classification with structured output, not creative generation. ~$0.01 total for 200 leads.
+**Why GPT 5.4:** Two reasons. First, the research step uses web search to gather real qualification signals — GPT 5.4 can search the internet and return factual results about funding, hiring, business model. Second, the evaluation step needs to interpret that research intelligently. The cost is higher than gpt-4o-mini but we're making ~15 research calls + ~4 evaluation calls, not 200.
 
-### System Prompt
+### Step 1: Company Research (web search)
 
-The prompt is designed to **complement the deterministic layer, not duplicate it.** Key guardrails added after edge-case review:
+```typescript
+async function researchCompany(name, domain, industry, tier, model): Promise<string>
+```
 
-1. **"Do NOT invent facts"** — The AI has no web access. Without this guardrail, it might hallucinate "this company recently raised Series B" based on general knowledge.
-2. **"Do NOT assume a company is a fit just because its own industry is manufacturing"** — The persona spec cares about companies that *sell into* complex verticals, not companies *in* those verticals. Steelcase *is* a manufacturer; "Allie - AI for Manufacturing" *sells into* manufacturing. Crucial distinction.
-3. **"Treat unknown signals as unknown"** — If funding/layoffs/hiring aren't obvious from the provided text, don't guess.
-4. **Within-company ranking** — When multiple leads from the same company appear, rank the primary buyer above champions.
+Before evaluating any leads, we research each unique company among candidates. This is the step that implements the persona spec's § Qualification Signals — the section that requires real-world knowledge about funding, hiring, PLG motion, layoffs, etc.
+
+**Research prompt asks for:**
+
+| Signal | What we're looking for |
+|--------|----------------------|
+| Recently raised funding | Amount, round, date |
+| Actively hiring SDRs/BDRs | Job postings on boards |
+| Sells into enterprise/mid-market | Who their customers are |
+| Long sales cycles | Industry norms |
+| Pipeline problems / scaling sales | Blog posts, social media |
+| SDR team size | Small = good (outsource), large = bad (in-house) |
+| PLG motion | Negative signal — outbound may not be primary |
+| Layoffs / cost-cutting | Negative signal — not in buying mode |
+| What they sell and to whom | Critical for "sells INTO" vs "is in" distinction |
+
+**Key design decisions:**
+
+- **One call per company, not per lead.** ~15 unique companies among candidates → 15 research calls. Research is cached in a `Map<string, string>` and shared across all leads at that company.
+- **Concurrency 5** — same pattern as evaluation batches. 15 companies ÷ 5 concurrent = 3 rounds.
+- **Graceful failure** — if research fails for a company, the evaluation still runs with "Research unavailable — evaluate using provided data only." No crash.
+- **`generateText` not `generateObject`** — research is free-form (bullet points). No need for structured output here. The evaluation step gets the research as plain text context.
+
+**Example research output:**
+```
+- B2B SaaS company selling AI-powered quality inspection to manufacturers
+- Raised $5M seed round (2024) — growth mandate, likely scaling pipeline
+- 11-50 employees, no dedicated SDR team visible on LinkedIn
+- Sells into manufacturing vertical (hospitals, factories) — strong Throxy fit
+- No layoffs or cost-cutting signals found
+```
+
+### Step 2: Lead Evaluation (with research context)
+
+The system prompt is designed to **consume the research, not generate it:**
+
+1. **"Use the research report as your primary source of company intelligence"** — The AI trusts the web search results from Step 1 rather than guessing from training data.
+2. **"If the research says 'unknown', treat it as unknown"** — Prevents the AI from filling gaps with hallucinated facts.
+3. **"Do NOT assume a company is a fit just because its own industry is manufacturing"** — The persona spec cares about companies that *sell into* complex verticals, not companies *in* those verticals. Steelcase *is* a manufacturer; "Allie - AI for Manufacturing" *sells into* manufacturing. Crucial distinction that even strong models get wrong without explicit guidance.
+4. **"Reference specific research findings in reasoning"** — Makes the output auditable. You can see *why* a lead got a high score: "Allie AI recently raised seed funding and sells into manufacturing — strong Throxy fit."
+5. **Within-company ranking** — When multiple leads from the same company appear, rank the primary buyer above champions. This supports the persona spec's multi-threading concept: at Mid-Market and Enterprise, you want to identify both the decision-maker (VP of Sales Dev) and the champions (BDR Managers, RevOps) — but champions should score lower than the primary buyer.
 
 ### Batch Formatting — Company-Grouped
 
@@ -253,16 +295,23 @@ function companyKey(c: LeadClassification): string {
 }
 ```
 
-Candidates are **sorted by company key** before chunking, then **grouped by company within each batch**. This means the AI sees all leads from the same company together:
+Candidates are **sorted by company key** before chunking, then **grouped by company within each batch**. Each company block now includes the research report from Step 1:
 
 ```
 Company: Allie - AI for Manufacturing (allie-ai.com) | Startup (1–50) | Software Development
+Research:
+- B2B SaaS selling AI-powered quality inspection to manufacturers
+- Raised $5M seed (2024) — growth mandate
+- No dedicated SDR team visible
+- Sells into manufacturing vertical — strong Throxy fit
+
+Leads:
 - [lead-3] Alex Sandoval — "Founder & CEO" | seniority=founder, department=executive, base_score=10
 - [lead-40] Daksha Romero — "Chief Revenue Officer (CRO)" | seniority=c_level, department=sales, base_score=10
 - [lead-60] Ernesto Hermosillo — "Chief Growth Officer" | seniority=c_level, department=gtm_growth, base_score=9
 ```
 
-**Why this matters:** The AI can apply within-company ranking — marking the CEO/Founder as the primary buyer and others as secondary, instead of evaluating each lead in isolation.
+**Why this matters:** The AI sees research + all leads for the same company together. It can apply within-company ranking with real context — not just guessing whether Allie AI is a good fit, but knowing they raised seed funding, sell into manufacturing, and have no SDR team.
 
 The sort order is: company key → base score (desc) → title (alpha). Highest-scored leads appear first so the AI sees the strongest candidates before weaker ones.
 
@@ -274,13 +323,14 @@ function applyPostFilter(result: RankingResult, classification: LeadClassificati
 
 This is the **key architectural addition**: soft exclusion enforcement runs *after* AI evaluation, deterministically. The AI cannot override these rules.
 
-| SoftExclusionKind | Action | Score cap | Rationale |
-|-------------------|--------|-----------|-----------|
-| `advisor_consultant_board` | Force `relevant: false` | 2 | Persona spec: "too removed from operations; no buying power" |
-| `account_executive` | Force `relevant: false` | 3 | Persona spec: "closers, not outbound owners" |
-| `marketing_leader` | Force `relevant: false` | 3 | Persona spec: "rarely owns outbound directly" |
-| `sdr_bdr` @ mid-market/enterprise | Keep AI's `relevant`, cap score | 5 | Persona spec: "may serve as internal champions" — not killed, but capped |
-| `sdr_bdr` @ startup/smb | Force `relevant: false` | 3 | Not decision-makers at this size, and no champion dynamic |
+| SoftExclusionKind | Tier | Action | Score cap | Rationale |
+|-------------------|------|--------|-----------|-----------|
+| `advisor_consultant_board` | any | Force `relevant: false` | 2 | Persona spec: "too removed from operations; no buying power" |
+| `account_executive` | any | Force `relevant: false` | 3 | Persona spec: "closers, not outbound owners" |
+| `marketing_leader` | startup | Keep AI's `relevant`, cap score | 6 | At startups, CMO/VP Marketing often owns outbound — no dedicated sales dev team. Capped below founders (the primary buyer). |
+| `marketing_leader` | SMB+ | Force `relevant: false` | 3 | Persona spec: "rarely owns outbound directly." At SMB+ sales leadership exists and owns outbound. |
+| `sdr_bdr` | mid-market/enterprise | Keep AI's `relevant`, cap score | 5 | Persona spec: "may serve as internal champions" — not killed, but capped below primary buyers. |
+| `sdr_bdr` | startup/smb | Force `relevant: false` | 3 | Not decision-makers at this size, and no champion dynamic. |
 
 The post-filter also **normalizes scores** — `Math.max(1, Math.min(10, Math.round(result.score)))` — to ensure the AI doesn't return fractional or out-of-range values.
 
@@ -299,12 +349,12 @@ function buildDeterministicResult(classification: LeadClassification, reasoning:
 
 Used when the AI is unavailable (API error, rate limit, timeout). Produces a result from the base score alone, still passing through `applyPostFilter` so soft exclusions are enforced even without AI.
 
-### AI Evaluation
+### Lead Evaluation
 
-`evaluateBatch()` sends ~20 leads to the AI and returns `RankingResult[]`.
+`evaluateBatch()` sends ~20 leads (with research context) to the AI and returns `RankingResult[]`.
 
 **Happy path:**
-1. `generateObject()` with Zod schema, system prompt, formatted batch
+1. `generateObject()` with Zod schema, system prompt, formatted batch (includes research per company)
 2. Map results by `lead_id`
 3. For each lead: apply `applyPostFilter(ai_result, classification)`
 4. If AI missed a lead → `buildDeterministicResult` fallback
@@ -313,18 +363,27 @@ Used when the AI is unavailable (API error, rate limit, timeout). Produces a res
 
 **`temperature: 0`** — Reproducibility. Same inputs → same outputs.
 
-### Concurrency
+### Concurrency and Timing
 
 ```
-BATCH_SIZE = 20, CONCURRENCY = 5
+RESEARCH_CONCURRENCY = 5, EVAL_CONCURRENCY = 5, BATCH_SIZE = 20
 ```
 
 ```
 200 leads → ~130 hard-excluded (instant) + ~70 candidates
-70 candidates → sorted by company → 4 batches
-4 batches processed in 1 round (all parallel)
-Total AI time: ~3–5 seconds
+                                            │
+                                ~15 unique companies
+                                            │
+                          Step 1: Research (5 concurrent)
+                          15 companies ÷ 5 = 3 rounds × ~5s = ~15s
+                                            │
+                          Step 2: Evaluate (5 concurrent)
+                          70 leads → 4 batches ÷ 5 = 1 round × ~5s = ~5s
+                                            │
+                          Total AI time: ~20 seconds
 ```
+
+The `maxDuration = 300` gives plenty of headroom. Web search calls are the slowest part (~3-5 seconds each), but concurrency keeps total time reasonable.
 
 ---
 
@@ -334,46 +393,63 @@ Total AI time: ~3–5 seconds
 CSV (200 leads)
   │
   ▼
-classifyLead() ─────────────────────────────────────┐
-  │                                                 │
-  ├─ tier = mapTier(employee_range)                 │
-  ├─ seniority = detectSeniority(title)             │
-  ├─ department = detectDepartment(title)            │
-  ├─ baseScore = seniority×tier + department         │
-  ├─ hardExcluded? ─── YES ─→ { relevant: false,   │
-  │                              score: 1, reason } │
-  │                                                 │
-  └─ softExcluded? ─── flag kind + continue         │
-                                                    │
-                 candidates (~70)                   │
-                     │                              │
-                     ▼                              │
-           sort by company, score                   │
-                     │                              │
-                     ▼                              │
-           chunk into batches of 20                 │
-                     │                              │
-                     ▼                              │
-           AI evaluateBatch()                       │
-           ┌──────────────────────┐                 │
-           │ generateObject()     │                 │
-           │ - company fit        │                 │
-           │ - title validation   │                 │
-           │ - within-co ranking  │                 │
-           │ - final score        │                 │
-           └─────────┬────────────┘                 │
-                     │                              │
-                     ▼                              │
-           applyPostFilter()                        │
-           ┌──────────────────────┐                 │
-           │ normalize score      │                 │
-           │ enforce soft excl.   │                 │
-           │ cap / force relevant │                 │
-           │ append reasoning     │                 │
-           └─────────┬────────────┘                 │
-                     │                              │
-                     ▼                              │
-           Combine all results ◄────────────────────┘
+classifyLead() ─────────────────────────────────────────┐
+  │                                                     │
+  ├─ tier = mapTier(employee_range)                     │
+  ├─ seniority = detectSeniority(title)                 │
+  ├─ department = detectDepartment(title)                │
+  ├─ baseScore = seniority×tier + department             │
+  ├─ hardExcluded? ─── YES ─→ { relevant: false,       │
+  │                              score: 1, reason }     │
+  │                                                     │
+  └─ softExcluded? ─── flag kind + continue             │
+                                                        │
+                 candidates (~70)                       │
+                     │                                  │
+                     ▼                                  │
+           extract ~15 unique companies                 │
+                     │                                  │
+                     ▼                                  │
+           Step 1: researchCompany()                    │
+           ┌──────────────────────────┐                 │
+           │ generateText + web search│                 │
+           │ - funding rounds         │                 │
+           │ - hiring SDRs/BDRs       │                 │
+           │ - PLG / B2C signals      │                 │
+           │ - what they sell & to whom│                │
+           │ - layoffs / cost-cutting  │                │
+           └─────────┬────────────────┘                 │
+                     │                                  │
+                     ▼                                  │
+           researchMap: Map<companyKey, report>          │
+                     │                                  │
+                     ▼                                  │
+           sort by company, score                       │
+           chunk into batches of 20                     │
+                     │                                  │
+                     ▼                                  │
+           Step 2: evaluateBatch()                      │
+           ┌──────────────────────────┐                 │
+           │ generateObject()         │                 │
+           │ + research context       │                 │
+           │ - company fit            │                 │
+           │ - title validation       │                 │
+           │ - within-co ranking      │                 │
+           │ - qualification signals  │                 │
+           │ - final score            │                 │
+           └─────────┬────────────────┘                 │
+                     │                                  │
+                     ▼                                  │
+           applyPostFilter()                            │
+           ┌──────────────────────────┐                 │
+           │ normalize score          │                 │
+           │ enforce soft excl.       │                 │
+           │ cap / force relevant     │                 │
+           │ append reasoning         │                 │
+           └─────────┬────────────────┘                 │
+                     │                                  │
+                     ▼                                  │
+           Combine all results ◄────────────────────────┘
                      │
                      ▼
            NextResponse.json({ results: RankingResult[200] })
@@ -392,9 +468,12 @@ classifyLead() ─────────────────────�
 | SDR/BDR kept as champions at mid-market+ | Hard-exclude all SDRs | Persona spec explicitly mentions "champions (essential) — BDR Managers" at enterprise. Capping at 5 preserves this. |
 | Company-grouped batching | Flat batches by count | Lets the AI compare peers at the same account and apply within-company ranking. |
 | Sort candidates by company → score | Random/insertion order | Keeps same-company leads together after chunking. High-score leads first so AI sees strongest candidates. |
-| Anti-hallucination guardrails in prompt | Trust AI judgment | Without guardrails, the AI invents "recently raised funding" or confuses "is in manufacturing" with "sells into manufacturing." |
+| Two-step AI: research then evaluate | Single AI call for everything | Research is per company (~15 calls), evaluation is per lead batch (~4 calls). Separating them means: research is cached and shared, failures are isolated, and the evaluation prompt gets factual context instead of guessing. |
+| Web search for qualification signals | Training knowledge only | Persona spec § Qualification Signals requires real data (funding, hiring SDRs, PLG). Web search gets current facts. Training knowledge is stale — a company may have raised a round last month. |
+| Research failure → graceful degradation | Research failure → skip company | If web search fails for one company, evaluation still runs with "Research unavailable." Better than skipping all leads at that company. |
+| "Sells INTO manufacturing" guardrail | Trust AI to infer | Even strong models confuse "company is in manufacturing" with "company sells into manufacturing." Explicit prompt guardrail prevents this. |
 | CRO matched as sales, not executive | Let executive catch it | CRO owns pipeline — that's sales function (score 5), not generic executive (score 1-2 at SMB+). |
-| gpt-4o-mini / claude-sonnet | gpt-4o / claude-opus | Classification task. Cheaper model is sufficient. Total cost < $0.01. |
+| GPT 5.4 / claude-sonnet | gpt-4o-mini (cheaper) | Web search + structured output needs a capable model. Cost is higher but we're making ~19 total calls, not 200. |
 | temperature: 0 | temperature: 0.3+ | Reproducibility matters for ranking. |
 | Full persona spec in prompt | Summarized rules | 6K tokens is cheap. Summary risks losing nuance. |
 | Graceful degradation on AI error | Fail the whole request | `buildDeterministicResult` + `applyPostFilter` still produces reasonable results without AI. |
