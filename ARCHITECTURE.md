@@ -4,15 +4,17 @@
 
 **Deterministic where possible, AI only where judgment is needed.**
 
-The ranking system is split into two layers:
+The ranking system is split into three layers:
 
-1. **Deterministic layer** (`src/lib/classify.ts`) — Rules directly derived from the persona spec. No API calls, no cost, reproducible results. Handles ~60–70% of leads instantly via hard exclusions.
-2. **AI layer** (`src/app/api/rank/route.ts`) — Uses an LLM only for things that require real-world knowledge or interpretation: company fit, ambiguous titles, qualification signals.
+1. **Deterministic classification** (`src/lib/classify.ts`) — Rules derived directly from the persona spec. No API calls, no cost, reproducible. Handles ~60–70% of leads instantly via hard exclusions.
+2. **AI evaluation** (`src/app/api/rank/route.ts`) — Uses an LLM only for things that need real-world knowledge or interpretation: company fit, ambiguous titles, within-company ranking.
+3. **Deterministic post-filter** (`applyPostFilter` in route.ts) — Enforces soft exclusion rules *after* the AI returns. The AI can't override these — they're business rules, not suggestions.
 
 This means:
 - Most leads never touch the LLM (cheaper, faster)
 - The LLM focuses on what it's actually good at (judgment, not table lookups)
-- Results are partially reproducible — the deterministic portion never changes
+- Soft exclusions are enforced deterministically, not left to the AI's discretion
+- The system degrades gracefully if the AI is unavailable
 
 ---
 
@@ -20,9 +22,26 @@ This means:
 
 ### Overview
 
-Every lead goes through `classifyLead()`, which produces a `LeadClassification` object containing: tier, seniority, department, base score, and exclusion status. This is pure computation — no async, no API calls.
+Every lead goes through `classifyLead()`, which produces a `LeadClassification` object containing: tier, seniority, department, base score, hard/soft exclusion status, and a typed `SoftExclusionKind` for the post-filter. Pure computation — no async, no API calls.
 
-### Step 1: Tier Mapping (lines 33–55)
+### Types
+
+```typescript
+CompanyTier   = "startup" | "smb" | "mid_market" | "enterprise" | "unknown"
+Seniority     = "founder" | "c_level" | "vp" | "director" | "manager" | "ic"
+Department    = "sales_development" | "sales" | "revenue_operations" | "business_development"
+              | "gtm_growth" | "executive" | "finance" | "engineering" | "hr" | "legal"
+              | "customer_success" | "product" | "marketing" | "operations" | "other"
+SoftExclusionKind = "sdr_bdr" | "account_executive" | "marketing_leader" | "advisor_consultant_board"
+```
+
+`Department` is a proper union type (not `string`), which prevents typos in downstream `switch`/`if` checks.
+
+`SoftExclusionKind` is a discriminant used by the post-filter — each kind maps to a specific enforcement rule.
+
+---
+
+### Step 1: Tier Mapping
 
 ```
 employee_range → CompanyTier
@@ -36,21 +55,19 @@ employee_range → CompanyTier
 | 1001-5000, 10001+ | enterprise | "Enterprise (1,000+ employees)" |
 | empty / unrecognized | unknown | Defaults to moderate scores |
 
-This is a simple lookup table — `TIER_MAP[range]`. No ambiguity, no AI needed.
+Simple lookup — `TIER_MAP[range]`. No ambiguity, no AI needed.
 
-**Why this matters:** The persona spec's entire targeting strategy changes by tier. A CEO is a 5/5 target at startups but a hard exclusion at enterprise. Getting the tier wrong would cascade into every downstream decision.
-
-`TIER_LABELS` is a human-readable mapping used in the AI prompt so the LLM knows what "startup" means in context.
+**Why this matters:** The persona spec's entire targeting strategy changes by tier. A CEO is a 5/5 target at startups but a hard exclusion at enterprise. Getting the tier wrong cascades into every downstream decision.
 
 ---
 
-### Step 2: Seniority Detection (lines 60–76)
+### Step 2: Seniority Detection
 
 ```
-job_title → Seniority (founder | c_level | vp | director | manager | ic)
+job_title → Seniority
 ```
 
-Uses an ordered array of `[Seniority, RegExp]` pairs. **Order is critical** — the first match wins:
+Uses an ordered array of `[Seniority, RegExp]` pairs. **First match wins:**
 
 1. **founder** — `/co-?founder|co-?owner/i`
    Matches: "Founder & CEO", "Co-Founder", "Company Owner"
@@ -60,69 +77,65 @@ Uses an ordered array of `[Seniority, RegExp]` pairs. **Order is critical** — 
 
 3. **vp** — `/vp|vice president|head of/i`
    Matches: "VP of Sales", "Vice President", "Head of Business Development"
-   **Note:** "Head of" is mapped to VP because the persona spec lists "Head of Sales" at the same priority as "VP of Sales" in the SMB and Mid-Market tiers.
 
 4. **director** — `/director|directeur/i`
    Matches: "Sales Director", "Director of Sales Development"
-   Includes French "directeur" for multilingual data.
 
 5. **manager** — `/manager|supervisor|jefe/i`
    Matches: "Regional Sales Manager", "Sales Supervisor"
-   Includes Spanish "jefe/jefa" for multilingual data.
 
 6. **ic** (default) — Everything else.
-   Matches: "Business Analyst", "BDR", "Sales Associate"
 
-**Why founder beats c_level:** "Founder & CEO" should be classified as founder (highest priority at startups), not c_level. If c_level matched first, the title would get c_level behavior, which is similar but semantically wrong — the persona spec distinguishes them in the seniority matrix.
+**Why founder beats c_level:** "Founder & CEO" should be classified as founder (5/5 at startups in the seniority matrix), not c_level. The persona spec distinguishes them.
 
-**Why "Head of" is VP, not manager:** The persona spec lists "Head of Sales" alongside VPs as primary targets with the same priority scores (5/5 at SMB). Treating "Head of" as manager would under-score these leads.
+**Why "Head of" is VP, not manager:** The persona spec lists "Head of Sales" at the same priority as "VP of Sales" (5/5 at SMB). Treating it as manager would under-score.
+
+**Multilingual support:** Includes French (`président`, `directeur`), Spanish (`jefe/jefa`), and Portuguese (`presidente`) patterns since the CSV contains non-English titles.
 
 ---
 
-### Step 3: Department Detection (lines 80–124)
+### Step 3: Department Detection
 
 ```
-job_title → department string
+job_title → Department
 ```
 
-Also an ordered array — **specific departments before broad ones** to avoid false matches:
+Ordered array — **specific departments before broad ones** to prevent false matches:
 
 | Order | Department | Example patterns | Why this position |
 |-------|-----------|-----------------|-------------------|
 | 1 | sales_development | "sales development", "SDR", "BDR" | Most specific sales sub-type |
-| 2 | revenue_operations | "revenue operations", "RevOps", "sales operations" | Specific ops sub-type |
-| 3 | business_development | "business development" | Before generic "sales" |
-| 4 | gtm_growth | "GTM", "growth" | Before generic "sales" |
-| 5 | customer_success | "customer success/service" | Before generic "sales" |
-| 6 | hr | "human resources", "ressources humaines", "talent", "recruit" | Multilingual |
+| 2 | revenue_operations | "revenue operations", "RevOps", "sales operations", "sales enablement", "revenue enablement" | Specific ops sub-type |
+| 3 | business_development | "business development", "partnerships", "alliances" | Before generic "sales" |
+| 4 | gtm_growth | "GTM", "growth", "go-to-market" | Before generic "sales" |
+| 5 | customer_success | "customer success/service" | |
+| 6 | hr | "human resources", "ressources humaines", "talent", "recruit", "employer brand" | Multilingual |
 | 7 | legal | "legal", "compliance", "counsel", "abogado" | Multilingual |
 | 8 | finance | "finance", "financial", "CFO", "accounting", "billing" | |
 | 9 | product | "product manag..." | Only matches "product manager/management", NOT "product engineer" |
 | 10 | marketing | "marketing", "CMO", "content creator", "graphic design" | |
-| 11 | **executive** | "CEO", "founder", "owner", "president", "managing director" | **Before sales/engineering** — see below |
-| 12 | sales | "sales", "account manager/executive", "commercial", "ventes" | Broad catch-all for sales roles |
+| 11 | **executive** | "CEO", "founder", "owner", "president", "managing director", "partner" | **Before sales/engineering** |
+| 12 | sales | "chief revenue officer", "CRO", "inside sales", "sales", "account manager/executive", "commercial", "ventes" | Broad catch-all |
 | 13 | engineering | "engineer", "developer", "welder", "operator", "technician", "quality", "production" | Broad catch-all for tech/manufacturing |
-| 14 | operations | "operations", "supply chain", "material planner/handler", "fulfillment" | Broadest |
+| 14 | operations | "operations", "supply chain", "material planner/handler", "fulfillment", "logistics" | Broadest |
 
-**Critical ordering decision: executive before sales/engineering.**
+**Executive before sales/engineering — prevents founder titles from falling into lower-scoring buckets.**
 
-The title "Co-Founder & CTO" contains both "founder" (executive) and implicitly "CTO" which would match engineering. By placing executive first, "founder" matches → department = executive. This is correct because:
-- At a startup, a co-founder/CTO is a decision-maker (executive function), not an engineer to exclude
-- The persona spec says founders at startups are 5/5 priority targets regardless of their other titles
+Note: CTO is *not* in the engineering regex (it was removed during edge-case review), so "Co-Founder & CTO" would match executive via `founder` regardless of ordering. The ordering mainly guards against titles that combine a founder/owner keyword with a sales keyword (e.g., a hypothetical "Owner & Sales Lead") — without this ordering, `sales` could match first and the lead would miss the executive department score (5 at startups vs 5 for sales — equal in this case, but conceptually wrong). At larger tiers the ordering barely matters: executives are either hard-excluded (CEO at mid-market+) or get low department scores (1–2) regardless.
 
-If engineering came first, "CTO" would match → department = engineering → hard excluded. That would wrongly filter out a primary target.
+**CRO in sales, not executive.** "Chief Revenue Officer" is explicitly matched by the sales pattern (`/chief revenue officer|cro/`) because CRO owns pipeline — that's the sales function, not a generic executive role. This ensures CROs at SMB+ get the correct department score (5) instead of the lower executive score.
 
-**Why "product manag..." and not "product":** The pattern `/product manag/` matches "Product Manager" and "Product Management" but NOT "Product Engineer" (which should be engineering) or "Product Marketing" (which should fall through to marketing).
+**"product manag..." not "product".** Matches "Product Manager" and "Product Management" but NOT "Product Engineer" (→ engineering) or "Product Marketing" (→ marketing).
 
 ---
 
-### Step 4: Scoring (lines 128–161)
+### Step 4: Scoring
 
 ```
 base_score = clamp(seniority_score + department_score, 1, 10)
 ```
 
-**Seniority × Tier matrix** (lines 128–135) — Directly from persona spec § Seniority Relevance Matrix:
+**Seniority × Tier matrix** — directly from persona spec § Seniority Relevance Matrix:
 
 ```
                 Startup  SMB  Mid-Market  Enterprise  Unknown
@@ -134,7 +147,7 @@ Manager            1      2       3           3          2
 IC                 0      0       1           1          0
 ```
 
-**Department scores** (lines 137–151) — From persona spec § Department Priority:
+**Department scores** — from persona spec § Department Priority:
 
 | Department | Score | Notes |
 |-----------|-------|-------|
@@ -143,222 +156,174 @@ IC                 0      0       1           1          0
 | revenue_operations | 4 | Controls process and tooling |
 | business_development | 4 | Often overlaps with sales dev |
 | gtm_growth | 4 | Strategic view of sales motion |
-| executive | **5 at startup, 2 at SMB, 1 elsewhere** | Persona spec: "5/5 → 1/5, only relevant at startups" |
+| executive | **5 at startup, 2 at SMB, 1 elsewhere** | Tier-dependent via `getDepartmentScore()` |
 | everything else | 0 | Not relevant departments |
+
+The `DEPARTMENT_SCORES` record lists all 15 department values exhaustively (all irrelevant ones set to 0). The `executive` case is handled separately in `getDepartmentScore()` because it's the only tier-dependent department.
 
 **Examples:**
 
 | Lead | Seniority × Tier | Department | Base Score |
 |------|-----------------|------------|------------|
-| VP of Sales @ SMB | 5 | 5 | **10** (perfect) |
-| Founder & CEO @ Startup | 5 | 5 | **10** (perfect) |
-| CEO @ Enterprise | 1 | 1 | **2** (terrible — also hard-excluded) |
-| Sales Manager @ Enterprise | 3 | 5 | **8** (good) |
-| IC Engineer @ Enterprise | 1 | 0 | **1** (irrelevant — also hard-excluded) |
-
-The `unknown` tier column uses moderate values (3, 4, 3...) so leads from companies with missing employee data get middle-of-the-road scores, letting the AI decide.
+| VP of Sales @ SMB | 5 | 5 | **10** |
+| Founder & CEO @ Startup | 5 | 5 | **10** |
+| CRO @ Startup | 5 (c_level) | 5 (sales) | **10** |
+| CEO @ Enterprise | 1 | 1 | **2** (also hard-excluded) |
+| Sales Manager @ Enterprise | 3 | 5 | **8** |
+| IC Engineer @ Enterprise | 1 | 0 | **1** (also hard-excluded) |
 
 ---
 
-### Step 5: Hard Exclusions (lines 165–204)
+### Step 5: Hard Exclusions
 
-These leads are **immediately marked as irrelevant** with no AI evaluation. The function returns a reason string (excluded) or null (not excluded).
+These leads are **immediately marked irrelevant** — no AI evaluation. Returns a reason string or null.
 
 **Check order:**
 
-1. **Unusable title** — Empty, < 3 characters, or looks like a URL (e.g., "allie-ai.com" as a job title — actual data error in the CSV). These can't be evaluated by anyone.
+1. **Unusable title** — Empty, < 3 chars, placeholder values (`undefined`, `null`, `n/a`, `none`), or domain-like strings (`allie-ai.com`, `bts-it.com`). The regex `/\b[\w-]+\.(com|ai|io|net|org|es|co|tech|industries)\b/i` catches URLs/domains that ended up in the title field — actual data errors in the CSV.
 
-2. **Not in workforce** — "Retired", "Student", "Intern". These are never decision-makers.
+2. **Government / public-sector accounts** — Checks `company + domain + industry` against patterns like `ayuntamiento`, `ajuntament`, `municipality`, `city of`, `ministry`, `.gov`, `.gob`, `.mil`. These are not B2B targets — filtering them deterministically saves AI tokens and prevents the LLM from wasting time evaluating government employees.
 
-3. **Startup founder exception** — If `seniority === "founder" && tier === "startup"`, skip ALL remaining exclusion checks. This is critical: "Co-Founder & CTO" at a 10-person startup should NOT be excluded for having "CTO" in the title. The persona spec lists Founder/Co-Founder as the #1 target for startups (5/5).
+3. **Not in workforce** — "Retired", "Student", "Intern" (but not "Internal").
 
-4. **CEO/President at mid-market+** — Persona spec § Hard Exclusions: "CEO / President (Mid-Market & Enterprise) — Too far removed from outbound execution." Only tier-dependent hard exclusion.
+4. **Assistant roles** — "Executive Assistant", "Administrative Assistant". These were a false positive in the original version: "Senior Executive Assistant: Chief Financial Officer" would match `c_level` seniority because of "Chief", but the person is an assistant, not the CFO.
 
-5. **Department-based exclusions** (any tier):
-   - finance → "Wrong department"
-   - engineering → "No relevance to sales"
-   - hr → "Will slow deals or ignore outreach"
-   - legal → "Will slow deals or ignore outreach"
-   - customer_success → "Post-sale focus"
-   - product → "Different function entirely"
+5. **Startup founder exception** — `seniority === "founder" && tier === "startup"` → skip ALL remaining checks. "Co-Founder & CTO" at a 10-person startup must NOT be excluded for CTO. Persona spec says Founder/Co-Founder = #1 target at startups (5/5).
 
-**Why we're conservative:** If a title is ambiguous (e.g., "Head of Business Operations & Finance"), the department detection might pick "gtm_growth" (from "business") before "finance". That's fine — the AI will see the full title and can mark it irrelevant if it disagrees. We only hard-exclude when the keyword match is unambiguous.
+6. **CEO/President at mid-market+** — Persona spec § Hard Exclusions: "Too far removed from outbound execution."
+
+7. **Department-based exclusions** (any tier): finance, engineering, hr, legal, customer_success, product.
 
 ---
 
-### Step 6: Soft Exclusions (lines 208–223)
+### Step 6: Soft Exclusions
 
-Leads matching soft exclusions are **NOT filtered out**. They're flagged and sent to the AI with a warning note. The AI decides the final verdict.
+Returns `{ kind: SoftExclusionKind; reason: string }` or null. The `kind` field drives the deterministic post-filter in route.ts.
 
-From persona spec § Soft Exclusions:
+| Pattern | Kind | Reason |
+|---------|------|--------|
+| BDR/SDR | `sdr_bdr` | Not decision-makers |
+| Account Executive | `account_executive` | Closers, not outbound owners |
+| CMO / VP Marketing (but NOT if "business development" also in title) | `marketing_leader` | Rarely owns outbound |
+| Advisor / Consultant / Board | `advisor_consultant_board` | Too removed or no buying power |
 
-| Pattern | Reason |
-|---------|--------|
-| BDR/SDR | "May feel threatened; not decision-makers" |
-| Account Executive | "Closers, not outbound owners" |
-| CMO / VP Marketing | "Rarely owns outbound directly" |
-| Advisor/Consultant/Board | "Too removed from operations; no buying power" |
-
-Soft exclusions only run if the lead wasn't already hard-excluded (no point double-flagging).
+**Guard on marketing_leader:** The check `!/business development/i.test(title)` prevents false positives on titles like "VP of Marketing & Business Development" where the person actually does outbound-adjacent work.
 
 ---
 
-### Step 7: classifyLead() (lines 227–248)
-
-Orchestrates all the above in order:
-
-1. Map tier from employee_range
-2. Detect seniority from job title
-3. Detect department from job title
-4. Compute base score from seniority × tier + department
-5. Check hard exclusion → if excluded, set reason and skip soft check
-6. Check soft exclusion → if flagged, set reason
-7. Return the full `LeadClassification` object
-
----
-
-## route.ts — API Route with AI Evaluation
+## route.ts — API Route
 
 ### Overview
 
-The POST handler orchestrates the full ranking pipeline:
+The POST handler orchestrates the full pipeline:
 1. Classify all leads deterministically
 2. Return instant results for hard-excluded leads
-3. Batch remaining candidates and send to AI
-4. Combine and return all 200 results
+3. Sort candidates by company → batch → send to AI
+4. Apply deterministic post-filter to AI results
+5. Combine and return all 200 results
 
-### Model Selection (lines 20–28)
+### Model Selection
 
 ```typescript
 function getModel() {
-  if (process.env.OPENAI_API_KEY) return openai("gpt-4o-mini");
-  if (process.env.ANTHROPIC_API_KEY) return anthropic("claude-sonnet-4-20250514");
+  if (process.env.OPENAI_API_KEY) return openai(process.env.OPENAI_MODEL ?? "gpt-4o-mini");
+  if (process.env.ANTHROPIC_API_KEY) return anthropic(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514");
   throw new Error("...");
 }
 ```
 
-Checks environment variables in order. Defaults to cheap, fast models suitable for classification tasks:
-- **gpt-4o-mini** — Very cheap ($0.15/1M input), good at structured output
-- **claude-sonnet-4-20250514** — Good balance of cost, speed, and quality
+Defaults to cheap, fast models suitable for classification. Model ID overridable via env vars.
 
-Model ID is overridable via `OPENAI_MODEL` / `ANTHROPIC_MODEL` env vars without code changes.
+**Why gpt-4o-mini:** Classification with structured output, not creative generation. ~$0.01 total for 200 leads.
 
-**Why gpt-4o-mini over gpt-4o:** The AI layer isn't doing creative generation — it's classification with structured output. gpt-4o-mini handles this well at 1/10th the cost. Total API cost for ~200 leads: < $0.01.
+### System Prompt
 
-### Structured Output Schema (lines 32–41)
+The prompt is designed to **complement the deterministic layer, not duplicate it.** Key guardrails added after edge-case review:
+
+1. **"Do NOT invent facts"** — The AI has no web access. Without this guardrail, it might hallucinate "this company recently raised Series B" based on general knowledge.
+2. **"Do NOT assume a company is a fit just because its own industry is manufacturing"** — The persona spec cares about companies that *sell into* complex verticals, not companies *in* those verticals. Steelcase *is* a manufacturer; "Allie - AI for Manufacturing" *sells into* manufacturing. Crucial distinction.
+3. **"Treat unknown signals as unknown"** — If funding/layoffs/hiring aren't obvious from the provided text, don't guess.
+4. **Within-company ranking** — When multiple leads from the same company appear, rank the primary buyer above champions.
+
+### Batch Formatting — Company-Grouped
 
 ```typescript
-const EvaluationSchema = z.object({
-  evaluations: z.array(z.object({
-    lead_id: z.string(),
-    relevant: z.boolean(),
-    score: z.number().min(1).max(10),
-    reasoning: z.string(),
-  })),
-});
+function companyKey(c: LeadClassification): string {
+  return `${c.lead.company}::${c.lead.domain}`.toLowerCase();
+}
 ```
 
-Uses Zod schema with `generateObject()` from the Vercel AI SDK. This gives:
-- **Type-safe responses** — no JSON parsing or string extraction
-- **Automatic validation** — if the LLM returns malformed data, it throws (caught by our error handler)
-- **Provider-agnostic** — works with both OpenAI (function calling) and Anthropic (tool use) under the hood
-
-The `.describe()` calls on each field are hints for the LLM about what to put in each field.
-
-### System Prompt (lines 45–72)
-
-The prompt is designed to **complement the deterministic layer, not duplicate it:**
-
-1. **Tells the AI what's already been done** — tier, seniority, department, base score are pre-computed
-2. **Tells the AI what to focus on:**
-   - **Company fit** — Is this a B2B company? Government? Non-profit? B2C?
-   - **Title accuracy** — Override the keyword-based classification for ambiguous titles
-   - **Qualification signals** — Funding, hiring SDRs, PLG model, layoffs (requires real-world knowledge we don't have in the CSV)
-   - **Relevance verdict** — Final yes/no with reasoning
-3. **Includes the full persona spec** in `<persona_spec>` tags so the AI has all the context
-4. **Conservative bias** — "when uncertain about relevance, lean toward false" (better to miss a lead than to contact someone irrelevant)
-
-**Why include the full spec instead of a summary?** The spec is ~5,000 words / ~6,000 tokens. At $0.15/1M tokens (gpt-4o-mini), sending it in every batch costs fractions of a cent. Summarizing risks losing nuance (like the champion concept at mid-market, or the "sells INTO manufacturing" distinction).
-
-### Batch Formatting (lines 76–87)
-
-Each lead is formatted as a structured block for the AI:
+Candidates are **sorted by company key** before chunking, then **grouped by company within each batch**. This means the AI sees all leads from the same company together:
 
 ```
-[lead-3] Alex Sandoval — "Founder & CEO"
-  Company: Allie - AI for Manufacturing (allie-ai.com) | Startup (1–50) | Software Development
-  Pre-classified: seniority=founder, department=executive, base_score=10
+Company: Allie - AI for Manufacturing (allie-ai.com) | Startup (1–50) | Software Development
+- [lead-3] Alex Sandoval — "Founder & CEO" | seniority=founder, department=executive, base_score=10
+- [lead-40] Daksha Romero — "Chief Revenue Officer (CRO)" | seniority=c_level, department=sales, base_score=10
+- [lead-60] Ernesto Hermosillo — "Chief Growth Officer" | seniority=c_level, department=gtm_growth, base_score=9
 ```
 
-If the lead has a soft exclusion flag:
+**Why this matters:** The AI can apply within-company ranking — marking the CEO/Founder as the primary buyer and others as secondary, instead of evaluating each lead in isolation.
+
+The sort order is: company key → base score (desc) → title (alpha). Highest-scored leads appear first so the AI sees the strongest candidates before weaker ones.
+
+### Deterministic Post-Filter
+
+```typescript
+function applyPostFilter(result: RankingResult, classification: LeadClassification): RankingResult
 ```
-  NOTE: Soft exclusion — Advisor/Consultant/Board — too removed or no buying power
+
+This is the **key architectural addition**: soft exclusion enforcement runs *after* AI evaluation, deterministically. The AI cannot override these rules.
+
+| SoftExclusionKind | Action | Score cap | Rationale |
+|-------------------|--------|-----------|-----------|
+| `advisor_consultant_board` | Force `relevant: false` | 2 | Persona spec: "too removed from operations; no buying power" |
+| `account_executive` | Force `relevant: false` | 3 | Persona spec: "closers, not outbound owners" |
+| `marketing_leader` | Force `relevant: false` | 3 | Persona spec: "rarely owns outbound directly" |
+| `sdr_bdr` @ mid-market/enterprise | Keep AI's `relevant`, cap score | 5 | Persona spec: "may serve as internal champions" — not killed, but capped |
+| `sdr_bdr` @ startup/smb | Force `relevant: false` | 3 | Not decision-makers at this size, and no champion dynamic |
+
+The post-filter also **normalizes scores** — `Math.max(1, Math.min(10, Math.round(result.score)))` — to ensure the AI doesn't return fractional or out-of-range values.
+
+Reasoning is appended (not replaced) with a `Post-filter:` suffix so the review can see both the AI's original reasoning and the deterministic override.
+
+**Why post-filter instead of hard exclusion?**
+- Hard exclusions never go to the AI → no reasoning generated
+- Post-filter lets the AI evaluate first (useful for the reasoning text), then enforces business rules on top
+- SDR/BDR at mid-market+ can remain relevant as champions — hard exclusion would lose this nuance
+
+### Fallback Behavior
+
+```typescript
+function buildDeterministicResult(classification: LeadClassification, reasoning: string): RankingResult
 ```
 
-This gives the AI everything it needs in a scannable format: who the person is, what the deterministic layer thinks, and any flags to consider.
+Used when the AI is unavailable (API error, rate limit, timeout). Produces a result from the base score alone, still passing through `applyPostFilter` so soft exclusions are enforced even without AI.
 
-### AI Evaluation (lines 91–126)
+### AI Evaluation
 
-`evaluateBatch()` sends one batch of ~20 leads to the AI and returns `RankingResult[]`.
+`evaluateBatch()` sends ~20 leads to the AI and returns `RankingResult[]`.
 
 **Happy path:**
-1. Call `generateObject()` with the schema, system prompt, and formatted batch
-2. Map results by `lead_id` into a lookup
-3. For each lead in the batch, return the AI's evaluation if found
-4. If the AI missed a lead (shouldn't happen, but defensive), fall back to deterministic: `relevant = baseScore >= 5`
+1. `generateObject()` with Zod schema, system prompt, formatted batch
+2. Map results by `lead_id`
+3. For each lead: apply `applyPostFilter(ai_result, classification)`
+4. If AI missed a lead → `buildDeterministicResult` fallback
 
-**Error path:**
-- If the entire AI call fails (rate limit, timeout, model error), **fall back to deterministic scoring for the whole batch**
-- The reasoning says "(AI unavailable)" so the user knows these weren't AI-evaluated
-- The system doesn't crash — it degrades gracefully
+**Error path:** Fall back to deterministic for the entire batch. Reasoning says "(AI unavailable)".
 
-**`temperature: 0`** — Ensures consistent results across runs. This is a classification task, not creative writing. Same inputs should produce same outputs.
+**`temperature: 0`** — Reproducibility. Same inputs → same outputs.
 
-### Concurrency Control (lines 159–171)
+### Concurrency
 
-```typescript
-const BATCH_SIZE = 20;
-const CONCURRENCY = 5;
 ```
-
-Leads are split into batches of 20, then processed 5 batches at a time:
+BATCH_SIZE = 20, CONCURRENCY = 5
+```
 
 ```
 200 leads → ~130 hard-excluded (instant) + ~70 candidates
-70 candidates → 4 batches of 20 (last batch has 10)
-Batch 1-4 processed: round 1 (all 4 in parallel)
-Total: 1 round of API calls, ~3-5 seconds
-```
-
-**Why batch at 20, not per-company or per-lead?**
-- Per-lead (200 API calls) = slow and expensive
-- Per-company = uneven batches (Steelcase might have 5 candidates, but a startup has 2). Many tiny calls.
-- Fixed batches of 20 = predictable latency, simple code, good token density per call
-
-**Why concurrency 5?** Avoids hitting API rate limits while still being fast. 5 parallel calls × 3-5 seconds = total ~5 seconds for all AI evaluation.
-
-### POST Handler (lines 138–186)
-
-The main flow:
-
-```
-LEADS (200)
-  ↓ classifyLead() for each
-  ├── hardExcluded (~130) → instant RankingResult { relevant: false, score: 1 }
-  └── candidates (~70)
-        ↓ chunk into batches of 20
-        ↓ evaluateBatch() × 4 batches (5 concurrent)
-        ↓ AI returns RankingResult[] per batch
-  ↓
-Combine all results (200 total) → NextResponse.json({ results })
-```
-
-Error handling wraps the entire flow. If `getModel()` throws (no API key), it returns a 500 with a helpful message. If anything else fails, same pattern.
-
-Console logs at key milestones help during the review demo:
-```
-Classified 200 leads: 132 hard-excluded, 68 candidates
-AI evaluated 68 leads across 4 batch(es)
+70 candidates → sorted by company → 4 batches
+4 batches processed in 1 round (all parallel)
+Total AI time: ~3–5 seconds
 ```
 
 ---
@@ -369,39 +334,49 @@ AI evaluated 68 leads across 4 batch(es)
 CSV (200 leads)
   │
   ▼
-classifyLead() ──────────────────────────────┐
-  │                                          │
-  ├─ tier = mapTier(employee_range)          │
-  ├─ seniority = detectSeniority(title)      │
-  ├─ department = detectDepartment(title)    │
-  ├─ baseScore = seniority×tier + dept       │
-  ├─ hardExcluded? ──── YES ─→ { relevant: false, score: 1, reason }
-  │                                          │
-  └─ softExcluded? ──── flag but continue    │
-                                             │
-                    candidates (~70)          │
-                        │                    │
-                        ▼                    │
-              chunk into batches of 20       │
-                        │                    │
-                        ▼                    │
-              AI evaluateBatch()             │
-              ┌─────────────────────┐        │
-              │ generateObject()    │        │
-              │ - company fit       │        │
-              │ - title validation  │        │
-              │ - qual signals      │        │
-              │ - final score       │        │
-              └────────┬────────────┘        │
-                       │                     │
-                       ▼                     │
-              AI RankingResult[]             │
-                       │                     │
-                       ▼                     │
-              Combine all results ◄──────────┘
-                       │
-                       ▼
-              NextResponse.json({ results: RankingResult[200] })
+classifyLead() ─────────────────────────────────────┐
+  │                                                 │
+  ├─ tier = mapTier(employee_range)                 │
+  ├─ seniority = detectSeniority(title)             │
+  ├─ department = detectDepartment(title)            │
+  ├─ baseScore = seniority×tier + department         │
+  ├─ hardExcluded? ─── YES ─→ { relevant: false,   │
+  │                              score: 1, reason } │
+  │                                                 │
+  └─ softExcluded? ─── flag kind + continue         │
+                                                    │
+                 candidates (~70)                   │
+                     │                              │
+                     ▼                              │
+           sort by company, score                   │
+                     │                              │
+                     ▼                              │
+           chunk into batches of 20                 │
+                     │                              │
+                     ▼                              │
+           AI evaluateBatch()                       │
+           ┌──────────────────────┐                 │
+           │ generateObject()     │                 │
+           │ - company fit        │                 │
+           │ - title validation   │                 │
+           │ - within-co ranking  │                 │
+           │ - final score        │                 │
+           └─────────┬────────────┘                 │
+                     │                              │
+                     ▼                              │
+           applyPostFilter()                        │
+           ┌──────────────────────┐                 │
+           │ normalize score      │                 │
+           │ enforce soft excl.   │                 │
+           │ cap / force relevant │                 │
+           │ append reasoning     │                 │
+           └─────────┬────────────┘                 │
+                     │                              │
+                     ▼                              │
+           Combine all results ◄────────────────────┘
+                     │
+                     ▼
+           NextResponse.json({ results: RankingResult[200] })
 ```
 
 ---
@@ -411,11 +386,16 @@ classifyLead() ─────────────────────�
 | Decision | Alternative | Why we chose this |
 |----------|-------------|-------------------|
 | Deterministic first, AI second | AI evaluates everything | Cheaper, faster, reproducible. AI focuses on judgment. |
-| Hard-exclude aggressively | Send borderline leads to AI | ~130 leads instantly resolved saves tokens and time. Only exclude when highly confident. |
-| Conservative soft exclusions | Hard-exclude soft cases too | Better to let AI decide on BDRs/AEs than to miss a potential champion. |
-| gpt-4o-mini / claude-sonnet | gpt-4o / claude-opus | Classification task, not creative. Cheaper model is sufficient. |
-| temperature: 0 | temperature: 0.3-0.7 | Reproducibility matters for a ranking system. |
-| Batch by count (20) | Batch by company | Simpler, predictable. Company context is included per-lead anyway. |
+| Hard-exclude government accounts deterministically | Let AI decide | "Ayuntamiento de Elche" is obviously not B2B. Saves tokens. |
+| Hard-exclude assistant roles | Let seniority detection handle it | "Executive Assistant: CFO" falsely matched c_level seniority. Explicit check is safer. |
+| Post-filter soft exclusions after AI | Let AI enforce them | Business rules shouldn't depend on LLM compliance. The AI generates reasoning; the post-filter enforces the rule. |
+| SDR/BDR kept as champions at mid-market+ | Hard-exclude all SDRs | Persona spec explicitly mentions "champions (essential) — BDR Managers" at enterprise. Capping at 5 preserves this. |
+| Company-grouped batching | Flat batches by count | Lets the AI compare peers at the same account and apply within-company ranking. |
+| Sort candidates by company → score | Random/insertion order | Keeps same-company leads together after chunking. High-score leads first so AI sees strongest candidates. |
+| Anti-hallucination guardrails in prompt | Trust AI judgment | Without guardrails, the AI invents "recently raised funding" or confuses "is in manufacturing" with "sells into manufacturing." |
+| CRO matched as sales, not executive | Let executive catch it | CRO owns pipeline — that's sales function (score 5), not generic executive (score 1-2 at SMB+). |
+| gpt-4o-mini / claude-sonnet | gpt-4o / claude-opus | Classification task. Cheaper model is sufficient. Total cost < $0.01. |
+| temperature: 0 | temperature: 0.3+ | Reproducibility matters for ranking. |
 | Full persona spec in prompt | Summarized rules | 6K tokens is cheap. Summary risks losing nuance. |
-| Fallback to deterministic on AI error | Fail the whole request | Graceful degradation > total failure. |
-| Startup founders bypass exclusions | Apply exclusions uniformly | Spec says founders are #1 target at startups, even if their title says CTO. |
+| Graceful degradation on AI error | Fail the whole request | `buildDeterministicResult` + `applyPostFilter` still produces reasonable results without AI. |
+| Startup founders bypass exclusions | Apply exclusions uniformly | Spec says founders = #1 target at startups, even if title says CTO. |

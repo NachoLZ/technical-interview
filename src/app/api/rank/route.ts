@@ -52,18 +52,26 @@ Each lead has been pre-classified deterministically:
 The tier classification is deterministic from employee count — do not change it.
 You MAY override the department/seniority if the title is ambiguous and your interpretation differs.
 
+Important guardrails:
+- Do NOT invent facts or pretend you researched the company. You are not browsing the web.
+- Use only the provided title, company name, domain, industry, and deterministic notes.
+- If a qualification signal (funding, layoffs, SDR hiring, PLG motion, etc.) is not obvious from the provided text, treat it as unknown.
+- Do NOT assume a company is a fit just because its own industry is manufacturing, education, or healthcare. The persona cares about companies that SELL INTO complex verticals.
+
 Your job is to apply judgment where keyword matching falls short:
 
 1. COMPANY FIT: Is this a viable Throxy customer?
    - Must be a B2B company (not government, non-profit, or B2C)
-   - Ideally sells into complex verticals (manufacturing, education, healthcare)
-   - Consider qualification signals you know about: funding, hiring SDRs, PLG model, layoffs, etc.
+   - Prefer companies likely to benefit from complex outbound motions
+   - Consider qualification signals only when they are directly supported by the provided text
 
 2. TITLE ACCURACY: Validate the pre-classified seniority/department for ambiguous titles
 
 3. SCORE ADJUSTMENT: Adjust the base score (1–10) based on company fit and signals
 
 4. RELEVANCE: Set relevant=false if the company is not a Throxy fit OR the person is in the wrong function/seniority
+
+5. WITHIN-COMPANY RANKING: When multiple contacts from the same company appear, prefer the people closest to owning outbound. Champions can be relevant, but should score below the primary buyer.
 
 Keep reasoning to 1–2 concise sentences. Be conservative — when uncertain about relevance, lean toward false.
 
@@ -73,17 +81,125 @@ ${PERSONA_SPEC}
 
 // ── Batch formatting ───────────────────────────────────────────────────
 
+function companyKey(c: LeadClassification): string {
+  return `${c.lead.company}::${c.lead.domain}`.toLowerCase();
+}
+
 function formatBatch(batch: LeadClassification[]): string {
-  return batch
-    .map((c) => {
-      const l = c.lead;
-      let line = `[${l.id}] ${l.first_name} ${l.last_name} — "${l.job_title}"`;
-      line += `\n  Company: ${l.company} (${l.domain}) | ${TIER_LABELS[c.tier]} | ${l.industry || "no industry listed"}`;
-      line += `\n  Pre-classified: seniority=${c.seniority}, department=${c.department}, base_score=${c.baseScore}`;
-      if (c.softExcluded) line += `\n  NOTE: Soft exclusion — ${c.exclusionReason}`;
-      return line;
+  const grouped = new Map<string, LeadClassification[]>();
+
+  for (const lead of batch) {
+    const key = companyKey(lead);
+    grouped.set(key, [...(grouped.get(key) ?? []), lead]);
+  }
+
+  return [...grouped.values()]
+    .map((group) => {
+      const first = group[0];
+      const companyHeader = `Company: ${first.lead.company} (${first.lead.domain}) | ${TIER_LABELS[first.tier]} | ${first.lead.industry || "no industry listed"}`;
+      const lines = group.map((c) => {
+        const l = c.lead;
+        let line = `- [${l.id}] ${l.first_name} ${l.last_name} — "${l.job_title}"`;
+        line += ` | seniority=${c.seniority}, department=${c.department}, base_score=${c.baseScore}`;
+        if (c.softExcluded) line += ` | soft_exclusion=${c.exclusionReason}`;
+        return line;
+      });
+
+      return `${companyHeader}\n${lines.join("\n")}`;
     })
     .join("\n\n");
+}
+
+function appendReasoning(reasoning: string, suffix: string): string {
+  return reasoning.includes(suffix) ? reasoning : `${reasoning} ${suffix}`.trim();
+}
+
+function applyPostFilter(
+  result: RankingResult,
+  classification: LeadClassification,
+): RankingResult {
+  const normalized = {
+    ...result,
+    score: Math.max(1, Math.min(10, Math.round(result.score))),
+  };
+
+  if (!classification.softExcluded || !classification.softExclusionKind) {
+    return normalized;
+  }
+
+  switch (classification.softExclusionKind) {
+    case "advisor_consultant_board":
+      return {
+        ...normalized,
+        relevant: false,
+        score: Math.min(normalized.score, 2),
+        reasoning: appendReasoning(
+          normalized.reasoning,
+          "Post-filter: advisory and consultant roles are too removed from day-to-day ownership.",
+        ),
+      };
+    case "account_executive":
+      return {
+        ...normalized,
+        relevant: false,
+        score: Math.min(normalized.score, 3),
+        reasoning: appendReasoning(
+          normalized.reasoning,
+          "Post-filter: account executives are closers, not outbound owners.",
+        ),
+      };
+    case "marketing_leader":
+      return {
+        ...normalized,
+        relevant: false,
+        score: Math.min(normalized.score, 3),
+        reasoning: appendReasoning(
+          normalized.reasoning,
+          "Post-filter: marketing leadership rarely owns outbound directly.",
+        ),
+      };
+    case "sdr_bdr":
+      if (
+        classification.tier === "mid_market" ||
+        classification.tier === "enterprise"
+      ) {
+        return {
+          ...normalized,
+          score: Math.min(normalized.score, 5),
+          reasoning: normalized.relevant
+            ? appendReasoning(
+                normalized.reasoning,
+                "Post-filter: treat SDR/BDR roles as possible champions, not primary buyers.",
+              )
+            : normalized.reasoning,
+        };
+      }
+
+      return {
+        ...normalized,
+        relevant: false,
+        score: Math.min(normalized.score, 3),
+        reasoning: appendReasoning(
+          normalized.reasoning,
+          "Post-filter: SDR/BDR roles are not decision-makers at this company size.",
+        ),
+      };
+  }
+}
+
+function buildDeterministicResult(
+  classification: LeadClassification,
+  reasoning: string,
+): RankingResult {
+  return applyPostFilter(
+    {
+      lead_id: classification.lead.id,
+      relevant: classification.baseScore >= 5,
+      score: classification.baseScore,
+      reasoning,
+    },
+    classification,
+  );
 }
 
 // ── AI evaluation per batch ────────────────────────────────────────────
@@ -106,22 +222,17 @@ async function evaluateBatch(
     // Ensure every lead has a result — fall back to deterministic if AI missed one
     return batch.map((c) => {
       const ai = aiMap.get(c.lead.id);
-      if (ai) return ai;
-      return {
-        lead_id: c.lead.id,
-        relevant: c.baseScore >= 5,
-        score: c.baseScore,
-        reasoning: "Scored by title and company profile",
-      };
+      if (ai) return applyPostFilter(ai, c);
+      return buildDeterministicResult(c, "Scored by title and company profile");
     });
   } catch (err) {
     console.error("AI batch failed, falling back to deterministic:", err);
-    return batch.map((c) => ({
-      lead_id: c.lead.id,
-      relevant: c.baseScore >= 5,
-      score: c.baseScore,
-      reasoning: "Scored by title and company profile (AI unavailable)",
-    }));
+    return batch.map((c) =>
+      buildDeterministicResult(
+        c,
+        "Scored by title and company profile (AI unavailable)",
+      ),
+    );
   }
 }
 
@@ -142,7 +253,14 @@ export async function POST(): Promise<NextResponse<RankResponse | ApiError>> {
     // 1. Classify every lead deterministically
     const classified = LEADS.map(classifyLead);
     const hardExcluded = classified.filter((c) => c.hardExcluded);
-    const candidates = classified.filter((c) => !c.hardExcluded);
+    const candidates = classified
+      .filter((c) => !c.hardExcluded)
+      .sort(
+        (a, b) =>
+          companyKey(a).localeCompare(companyKey(b)) ||
+          b.baseScore - a.baseScore ||
+          a.lead.job_title.localeCompare(b.lead.job_title),
+      );
 
     console.log(
       `Classified ${LEADS.length} leads: ${hardExcluded.length} hard-excluded, ${candidates.length} candidates`,
